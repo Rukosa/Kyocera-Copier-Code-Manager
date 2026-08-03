@@ -2000,7 +2000,7 @@ def main():
         "=" * 64
     )
 
-    #run_notification_script()
+    run_notification_script()
 
 
 if __name__ == "__main__":

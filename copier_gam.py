@@ -737,37 +737,79 @@ def write_deletion_queue(records):
 
 # QUEUE SAFETY
 
-def ensure_queues_are_clear():
+def process_existing_queues():
     """
-    Refuse to overwrite queue files from an unfinished previous run.
-    The copier-processing script should delete both queue files only
-    after every copier has completed successfully.
+    If copier queue files from a previous run still exist,
+    process them before performing a new reconciliation.
+
+    copier_account_manager.py will process the outstanding
+    copier work and copier_notify.py will remove the queues
+    after everything completes successfully.
+
+    If processing fails, an exception is raised and this
+    reconciliation run stops. The existing queues remain
+    available for the next retry.
     """
 
-    existing_queues = [
-        path
-        for path in (
-            CREATE_QUEUE_FILE,
-            DELETE_QUEUE_FILE,
-        )
-        if path.exists()
-    ]
+    create_exists = CREATE_QUEUE_FILE.exists()
+    delete_exists = DELETE_QUEUE_FILE.exists()
 
-    if not existing_queues:
+    if not create_exists and not delete_exists:
         return
 
-    queue_names = "\n".join(
-        f"  - {path.resolve()}"
-        for path in existing_queues
+    print(
+        "\nExisting copier queue files detected."
     )
 
-    raise RuntimeError(
-        "One or more copier queue files already exist:\n"
-        f"{queue_names}\n\n"
-        "These files may contain unprocessed copier changes. "
-        "Process the existing queues successfully on every copier "
-        "and then delete the queue files before running this "
-        "reconciliation script again."
+    print(
+        "Attempting to complete the previous "
+        "copier batch before reconciliation..."
+    )
+
+    if create_exists:
+        print(
+            f"  - {CREATE_QUEUE_FILE.resolve()}"
+        )
+
+    if delete_exists:
+        print(
+            f"  - {DELETE_QUEUE_FILE.resolve()}"
+        )
+
+    # Both queue files should normally exist together.
+    # copier_account_manager.py expects both files, so if
+    # only one exists we stop rather than guessing what
+    # happened to the other one.
+    if create_exists != delete_exists:
+        raise RuntimeError(
+            "Only one copier queue file exists.\n"
+            "Both the creation and deletion queues are "
+            "required to safely resume processing.\n\n"
+            "Manual intervention is required."
+        )
+
+    run_account_manager()
+
+    # The account manager launches copier_notify.py, which
+    # should remove both queues after successful completion.
+    # Verify that actually happened before touching the
+    # database or querying Google again.
+    if (
+        CREATE_QUEUE_FILE.exists()
+        or DELETE_QUEUE_FILE.exists()
+    ):
+        raise RuntimeError(
+            "The previous copier batch returned successfully, "
+            "but one or more queue files still exist.\n"
+            "Refusing to begin a new reconciliation."
+        )
+
+    print(
+        "\nPrevious copier batch completed successfully."
+    )
+
+    print(
+        "Continuing with current Google reconciliation..."
     )
 
 
@@ -1175,7 +1217,7 @@ def main():
     """
 
     # Never overwrite queues that may contain unfinished work.
-    ensure_queues_are_clear()
+    process_existing_queues()
 
     google_users = (
         get_eligible_google_users()
