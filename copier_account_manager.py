@@ -27,6 +27,9 @@ DELETE_QUEUE_FILE = Path(
     "copier_delete_queue.csv"
 )
 
+DATABASE_FILE = Path(
+    "copier_users.csv"
+)
 
 CREATE_QUEUE_FIELDS = [
     "google_id",
@@ -1541,6 +1544,95 @@ def names_match(
         == str(second_name).strip().casefold()
     )
 
+# Database Loader for copier bootstrap
+
+def load_bootstrap_database():
+    """
+    Load all current copier users from copier_users.csv.
+    These records are used to populate a new or replacement
+    copier without affecting the normal creation/deletion queues.
+    """
+
+    if not DATABASE_FILE.exists():
+        raise RuntimeError(
+            "Copier user database does not exist:\n"
+            f"  {DATABASE_FILE.resolve()}"
+        )
+
+    with DATABASE_FILE.open(
+        "r",
+        newline="",
+        encoding="utf-8-sig",
+    ) as file:
+        reader = csv.DictReader(
+            file
+        )
+
+        if reader.fieldnames is None:
+            raise RuntimeError(
+                f"{DATABASE_FILE} does not contain "
+                "a valid CSV header."
+            )
+
+        missing_fields = [
+            field
+            for field in CREATE_QUEUE_FIELDS
+            if field not in reader.fieldnames
+        ]
+
+        if missing_fields:
+            raise RuntimeError(
+                f"{DATABASE_FILE} is missing required columns: "
+                f"{', '.join(missing_fields)}"
+            )
+
+        records = []
+
+        for row_number, row in enumerate(
+            reader,
+            start=2,
+        ):
+            record = {
+                field: str(
+                    row.get(field, "") or ""
+                ).strip()
+                for field in CREATE_QUEUE_FIELDS
+            }
+
+            if not any(
+                record.values()
+            ):
+                continue
+
+            if not record["copier_code"]:
+                raise RuntimeError(
+                    f"{DATABASE_FILE} row "
+                    f"{row_number} has a blank "
+                    "copier_code."
+                )
+
+            if not record[
+                "copier_code"
+            ].isdigit():
+                raise RuntimeError(
+                    f"{DATABASE_FILE} row "
+                    f"{row_number} has an invalid "
+                    f"copier_code: "
+                    f"{record['copier_code']!r}"
+                )
+
+            records.append(
+                record
+            )
+
+    records.sort(
+        key=lambda record: int(
+            record["copier_code"]
+        )
+    )
+
+    return records
+
 
 # DELETION PROCESSING
 
@@ -1855,6 +1947,92 @@ def run_notification_script():
         "\nCopier notification script completed successfully."
     )
 
+# Copier bootstrap for new copiers
+
+def bootstrap_copier(
+    host,
+):
+    """
+    Populate one copier with every user currently stored in
+    copier_users.csv.
+    Bootstrap mode:
+        - Does not use the normal queue files.
+        - Does not process deletions.
+        - Does not notify users.
+        - Does not modify copier_users.csv.
+        - Only targets the supplied copier IP.
+        - Existing matching entries are skipped.
+    """
+
+    try:
+        host = str(
+            ipaddress.ip_address(
+                host
+            )
+        )
+
+    except ValueError as error:
+        raise RuntimeError(
+            f"Invalid copier IP address: {host!r}"
+        ) from error
+
+    records = load_bootstrap_database()
+
+    if not records:
+        raise RuntimeError(
+            f"{DATABASE_FILE} contains no users "
+            "to bootstrap."
+        )
+
+    print(
+        "\n"
+        + "=" * 64
+    )
+
+    print(
+        "COPIER BOOTSTRAP"
+    )
+
+    print(
+        "=" * 64
+    )
+
+    print(
+        f"Target copier: {host}"
+    )
+
+    print(
+        f"Accounts to check/create: "
+        f"{len(records)}"
+    )
+
+    print(
+        "\nBootstrap does not modify the normal "
+        "creation or deletion queues."
+    )
+
+    print(
+        "No user notifications will be sent."
+    )
+
+    process_creations_on_copier(
+        host,
+        records,
+    )
+
+    print(
+        "\n"
+        + "=" * 64
+    )
+
+    print(
+        f"BOOTSTRAP COMPLETED SUCCESSFULLY FOR {host}"
+    )
+
+    print(
+        "=" * 64
+    )
+
 # MAIN QUEUE PROCESSOR
 
 def main():
@@ -2004,13 +2182,48 @@ def main():
 
 
 if __name__ == "__main__":
+    bootstrap_mode = (
+        len(sys.argv) >= 2
+        and sys.argv[1] == "--bootstrap"
+    )
+
     try:
-        main()
+        if bootstrap_mode:
+
+            if len(sys.argv) != 3:
+                raise RuntimeError(
+                    "Bootstrap usage:\n"
+                    "  python copier_account_manager.py "
+                    "--bootstrap <copier_ip>"
+                )
+
+            bootstrap_copier(
+                sys.argv[2]
+            )
+
+        else:
+
+            if len(sys.argv) != 1:
+                raise RuntimeError(
+                    "Unknown command-line arguments.\n\n"
+                    "Normal usage:\n"
+                    "  python copier_account_manager.py\n\n"
+                    "Bootstrap usage:\n"
+                    "  python copier_account_manager.py "
+                    "--bootstrap <copier_ip>"
+                )
+
+            main()
 
     except KeyboardInterrupt:
         print(
-            "\nCancelled. Queue files were preserved."
+            "\nCancelled."
         )
+
+        if not bootstrap_mode:
+            print(
+                "Queue files were preserved."
+            )
 
         raise SystemExit(130)
 
@@ -2019,10 +2232,18 @@ if __name__ == "__main__":
             f"\nERROR: {error}"
         )
 
-        print(
-            "\nQueue files were preserved. "
-            "Correct the problem and rerun "
-            "copier_account_manager.py."
-        )
+        if bootstrap_mode:
+            print(
+                "\nBootstrap stopped. "
+                "The normal copier queues and database "
+                "were not modified."
+            )
+
+        else:
+            print(
+                "\nQueue files were preserved. "
+                "Correct the problem and rerun "
+                "copier_account_manager.py."
+            )
 
         raise SystemExit(1)
