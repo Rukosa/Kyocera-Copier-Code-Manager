@@ -11,7 +11,7 @@ from pathlib import Path
 from curl_cffi import requests
 
 USERNAME = "Admin"
-PASSWORD = "Password"
+PASSWORD = "password"
 
 REQUEST_TIMEOUT = 30
 
@@ -82,6 +82,9 @@ class Kyocera:
 
         # Address Book token
         self.address_hidden = None
+
+        # One Touch token
+        self.one_touch_hidden = None
 
         # Cached copier data
         self._accounts = None
@@ -1345,6 +1348,232 @@ class Kyocera:
             person["number"]
         )
 
+    # ONE TOUCH KEYS
+
+    def copier_code_to_one_touch_key(
+        self,
+        code,
+    ):
+        """
+        Convert a managed copier code to its One Touch key.
+
+        Examples:
+
+            1001 -> 1
+            1010 -> 10
+            1262 -> 262
+            1999 -> 999
+            1000 -> 1000
+
+        One Touch has only 1000 unique keys, so this mapping is
+        unique only for copier codes 1000-1999.
+        """
+
+        code = int(code)
+
+        if not 1000 <= code <= 1999:
+            raise RuntimeError(
+                f"Copier code {code} cannot be uniquely "
+                "mapped to a One Touch key. "
+                "One Touch-managed copier codes must currently "
+                "be between 1000 and 1999."
+            )
+
+        key = code % 1000
+
+        # There is no key 0. Code 1000 maps to key 1000.
+        if key == 0:
+            return 1000
+
+        return key
+
+
+    def open_one_touch_page(self):
+        """
+        Open the One Touch Key list page once to establish the
+        browser-like navigation state.
+        """
+
+        print(
+            "\nOpening One Touch Key page..."
+        )
+
+        response = self._get(
+            f"{self.base}/adbk/otkset/"
+            "Adbk_OtkSet_OtkSetLst.htm",
+            params={
+                "arg1": "1",
+            },
+            headers={
+                "Referer":
+                    f"{self.base}/startwlm/login.cgi"
+            },
+        )
+
+        self.dump(response)
+
+        self._check_response(
+            response,
+            "Could not open One Touch Key page",
+        )
+
+        return response.text
+
+
+    def fetch_one_touch_hidden_token(self):
+        """
+        Fetch the session token used for One Touch operations.
+
+        The HAR shows the One Touch list model exposes the same
+        hidden token for the session, so this only needs to be
+        fetched once per copier session.
+        """
+
+        print(
+            "\nFetching One Touch hidden token..."
+        )
+
+        response = self._get(
+            f"{self.base}/js/jssrc/model/"
+            "adbk/otkset/"
+            "Adbk_OtkSet_OtkSetLst.model.htm",
+            params={
+                "arg1": "1",
+                "arg3": "",
+            },
+            headers={
+                "Referer":
+                    f"{self.base}/adbk/otkset/"
+                    "Adbk_OtkSet_OtkSetLst.htm?"
+                    "arg1=1"
+            },
+        )
+
+        self.dump(response)
+
+        self._check_response(
+            response,
+            "Could not fetch One Touch model",
+        )
+
+        self.one_touch_hidden = (
+            self._extract_hidden_token(
+                response.text,
+                "One Touch",
+            )
+        )
+
+        print(
+            "\nOne Touch hidden token fetched"
+        )
+
+        return self.one_touch_hidden
+
+
+    def create_one_touch_key(
+        self,
+        key,
+        address_private_id,
+        name,
+    ):
+        """
+        Create or set a One Touch email key.
+
+        address_private_id is the copier-assigned internal
+        Address Book reference.
+
+        It is NOT the visible Address Book number.
+        """
+
+        if self.one_touch_hidden is None:
+            raise RuntimeError(
+                "One Touch token has not been fetched. "
+                "Call open_one_touch_page() and "
+                "fetch_one_touch_hidden_token() first."
+            )
+
+        print(
+            f"\nCreating One Touch key {key} "
+            f"for {name} "
+            f"(internal Address ID "
+            f"{address_private_id})..."
+        )
+
+        payload = {
+            "okhtmfile":
+                "/adbk/otkset/"
+                "Adbk_ExtAbk_Rslt.htm",
+
+            "failhtmfile":
+                "/adbk/otkset/"
+                "Adbk_ExtAbk_Err.htm",
+
+            "func":
+                "setOneTouchKeyProperty",
+
+            "arg01":
+                "1",
+
+            # Actual One Touch key number
+            "arg02":
+                str(key),
+
+            # Destination type 2 = email
+            "arg04":
+                "2",
+
+            # Copier's INTERNAL Address Book reference
+            "arg05":
+                str(address_private_id),
+
+            "tmpvalue":
+                "",
+
+            "hidden":
+                self.one_touch_hidden,
+
+            # Label displayed for the One Touch key
+            "arg03_OneTouchName":
+                name,
+
+            "submit001":
+                "Submit",
+        }
+
+        response = self._post(
+            f"{self.base}/adbk/otkset/set.cgi",
+            data=payload,
+            headers={
+                "Referer":
+                    f"{self.base}/adbk/otkset/"
+                    "Adbk_OtkSet_OtkSetPrty.htm",
+
+                "Origin":
+                    self.base,
+            },
+        )
+
+        self.dump(response)
+
+        if (
+            response.status_code == 200
+            and "Adbk_ExtAbk_Rslt"
+            in response.text
+        ):
+            print(
+                f"\nSUCCESS: One Touch key "
+                f"{key} created"
+            )
+
+            return True
+
+        print(
+            f"\nWARNING: Unexpected One Touch "
+            f"response for key {key}"
+        )
+
+        return False
+
     # SESSION CLEANUP
 
     def close(self):
@@ -1752,8 +1981,17 @@ def process_creations_on_copier(
     """
     Process every creation against one copier.
 
-    Correct existing entries are skipped. Conflicting existing
-    entries cause an error so they are not silently overwritten.
+    Processing occurs in two stages:
+
+        Stage 1:
+            Create Job Accounting and Address Book entries.
+
+        Stage 2:
+            Refresh the Address Book once, resolve each user's
+            copier-assigned internal Address Book ID, and create
+            their One Touch key.
+
+    Existing matching entries are skipped.
     """
 
     print(
@@ -1778,14 +2016,21 @@ def process_creations_on_copier(
     try:
         copier.login()
 
-        # Download the current copier state once.
+        # DOWNLOAD CURRENT STATE ONCE
+
         copier.get_all_accounts()
+
         copier.get_all_address_book(
             refresh=True
         )
 
         account_creation_ready = False
         address_creation_ready = False
+
+        # =====================================================
+        # STAGE 1
+        # JOB ACCOUNTING + ADDRESS BOOK
+        # =====================================================
 
         for record in creation_records:
 
@@ -1855,8 +2100,7 @@ def process_creations_on_copier(
 
             # ADDRESS BOOK
 
-            # Uses the cached Address Book downloaded once
-            # above instead of reloading all pages.
+            # Uses the cache downloaded once before this loop.
             existing_address = copier.find_address(
                 number=copier_code
             )
@@ -1901,6 +2145,106 @@ def process_creations_on_copier(
                         f"Failed to create Address "
                         f"Book number {copier_code} "
                         f"on {host}."
+                    )
+
+        # =====================================================
+        # STAGE 2
+        # ONE TOUCH KEYS
+        # =====================================================
+
+        if creation_records:
+
+            print(
+                "\n"
+                + "-" * 64
+            )
+
+            print(
+                "REFRESHING ADDRESS BOOK FOR "
+                "ONE TOUCH REFERENCES"
+            )
+
+            print(
+                "-" * 64
+            )
+
+            # This is the ONLY refresh after the creation loop.
+            #
+            # Newly created contacts now exist and their
+            # copier-assigned internal IDs can be discovered.
+            copier.get_all_address_book(
+                refresh=True
+            )
+
+            # Fetch the One Touch token once for the entire
+            # copier session.
+            copier.open_one_touch_page()
+
+            copier.fetch_one_touch_hidden_token()
+
+            for record in creation_records:
+
+                copier_code = record[
+                    "copier_code"
+                ]
+
+                display_name = record[
+                    "display_name"
+                ]
+
+                # CALCULATE ONE TOUCH KEY
+
+                one_touch_key = (
+                    copier.copier_code_to_one_touch_key(
+                        copier_code
+                    )
+                )
+
+                # LOOK UP ACTUAL INTERNAL ADDRESS BOOK ID
+
+                address = copier.find_address(
+                    number=copier_code
+                )
+
+                if address is None:
+                    raise RuntimeError(
+                        f"Cannot create One Touch key "
+                        f"{one_touch_key} for "
+                        f"{display_name} on {host}: "
+                        f"Address Book number "
+                        f"{copier_code} could not "
+                        "be found after creation."
+                    )
+
+                address_private_id = address[
+                    "private_id"
+                ]
+
+                print(
+                    f"\nOne Touch mapping:"
+                    f"\n  User: {display_name}"
+                    f"\n  Copier code: {copier_code}"
+                    f"\n  One Touch key: {one_touch_key}"
+                    f"\n  Address Book number: "
+                    f"{address['number']}"
+                    f"\n  Internal Address ID: "
+                    f"{address_private_id}"
+                )
+
+                success = (
+                    copier.create_one_touch_key(
+                        key=one_touch_key,
+                        address_private_id=
+                            address_private_id,
+                        name=display_name,
+                    )
+                )
+
+                if not success:
+                    raise RuntimeError(
+                        f"Failed to create One Touch "
+                        f"key {one_touch_key} for "
+                        f"{display_name} on {host}."
                     )
 
         print(
@@ -2027,6 +2371,223 @@ def bootstrap_copier(
 
     print(
         f"BOOTSTRAP COMPLETED SUCCESSFULLY FOR {host}"
+    )
+
+    print(
+        "=" * 64
+    )
+
+def create_all_one_touch_keys_on_copier(
+    host,
+    records,
+):
+    """
+    Create One Touch keys for every current database user on one
+    existing copier.
+
+    This does NOT:
+        - Create Job Accounting accounts
+        - Create Address Book entries
+        - Delete anything
+        - Touch queue files
+        - Send notifications
+
+    It assumes the Address Book entries already exist.
+    """
+
+    print(
+        "\n"
+        + "=" * 64
+    )
+
+    print(
+        f"ONE TOUCH SYNC ON COPIER {host}"
+    )
+
+    print(
+        "=" * 64
+    )
+
+    copier = Kyocera(
+        host,
+        USERNAME,
+        PASSWORD,
+    )
+
+    try:
+        copier.login()
+
+        # LOAD ADDRESS BOOK ONCE
+
+        print(
+            "\nLoading Address Book..."
+        )
+
+        copier.get_all_address_book(
+            refresh=True
+        )
+
+        # PREPARE ONE TOUCH ONCE
+
+        copier.open_one_touch_page()
+
+        copier.fetch_one_touch_hidden_token()
+
+        # CREATE KEYS
+
+        for index, record in enumerate(
+            records,
+            start=1,
+        ):
+
+            copier_code = record[
+                "copier_code"
+            ]
+
+            display_name = record[
+                "display_name"
+            ]
+
+            one_touch_key = (
+                copier.copier_code_to_one_touch_key(
+                    copier_code
+                )
+            )
+
+            # Find the user's actual Address Book entry.
+            #
+            # This uses the cached Address Book loaded above.
+            address = copier.find_address(
+                number=copier_code
+            )
+
+            if address is None:
+                raise RuntimeError(
+                    f"Cannot create One Touch key "
+                    f"{one_touch_key} for "
+                    f"{display_name} on {host}: "
+                    f"Address Book entry "
+                    f"{copier_code} was not found."
+                )
+
+            # IMPORTANT:
+            #
+            # private_id is the copier's internal sequential
+            # reference and may be completely different from
+            # copier_code.
+            address_private_id = address[
+                "private_id"
+            ]
+
+            print(
+                f"\n[{index}/{len(records)}] "
+                f"{display_name}"
+            )
+
+            print(
+                f"  Copier code:        "
+                f"{copier_code}"
+            )
+
+            print(
+                f"  One Touch key:      "
+                f"{one_touch_key}"
+            )
+
+            print(
+                f"  Address Book slot:  "
+                f"{address['number']}"
+            )
+
+            print(
+                f"  Internal reference: "
+                f"{address_private_id}"
+            )
+
+            success = (
+                copier.create_one_touch_key(
+                    key=one_touch_key,
+                    address_private_id=
+                        address_private_id,
+                    name=display_name,
+                )
+            )
+
+            if not success:
+                raise RuntimeError(
+                    f"Failed to create One Touch "
+                    f"key {one_touch_key} for "
+                    f"{display_name} on {host}."
+                )
+
+        print(
+            f"\nAll One Touch keys completed "
+            f"on {host}."
+        )
+
+    finally:
+        copier.close()
+
+def create_all_one_touch_keys():
+    """
+    One-time fleet migration.
+
+    Create One Touch keys for every current copier user on every
+    copier listed in copier_ips.csv.
+    """
+
+    records = load_bootstrap_database()
+
+    if not records:
+        raise RuntimeError(
+            f"{DATABASE_FILE} contains no users."
+        )
+
+    copier_ips = load_copier_ips()
+
+    print(
+        "\n"
+        + "#" * 64
+    )
+
+    print(
+        "ONE TOUCH FLEET MIGRATION"
+    )
+
+    print(
+        "#" * 64
+    )
+
+    print(
+        f"Users:   {len(records)}"
+    )
+
+    print(
+        f"Copiers: {len(copier_ips)}"
+    )
+
+    print(
+        "\nThis operation only creates One Touch keys."
+    )
+
+    print(
+        "Job Accounting, Address Book entries, "
+        "queues, and notifications are untouched."
+    )
+
+    for host in copier_ips:
+        create_all_one_touch_keys_on_copier(
+            host,
+            records,
+        )
+
+    print(
+        "\n"
+        + "=" * 64
+    )
+
+    print(
+        "ONE TOUCH FLEET MIGRATION COMPLETE"
     )
 
     print(
@@ -2182,12 +2743,21 @@ def main():
 
 
 if __name__ == "__main__":
+
     bootstrap_mode = (
         len(sys.argv) >= 2
         and sys.argv[1] == "--bootstrap"
     )
 
+    one_touch_all_mode = (
+        len(sys.argv) >= 2
+        and sys.argv[1] == "--onetouch-all"
+    )
+
     try:
+
+        # BOOTSTRAP ONE COPIER
+
         if bootstrap_mode:
 
             if len(sys.argv) != 3:
@@ -2201,26 +2771,51 @@ if __name__ == "__main__":
                 sys.argv[2]
             )
 
+        # ONE-TIME ONE TOUCH MIGRATION
+
+        elif one_touch_all_mode:
+
+            if len(sys.argv) != 2:
+                raise RuntimeError(
+                    "One Touch migration usage:\n"
+                    "  python copier_account_manager.py "
+                    "--onetouch-all"
+                )
+
+            create_all_one_touch_keys()
+
+        # NORMAL QUEUE PROCESSING
+
         else:
 
             if len(sys.argv) != 1:
                 raise RuntimeError(
                     "Unknown command-line arguments.\n\n"
+
                     "Normal usage:\n"
                     "  python copier_account_manager.py\n\n"
+
                     "Bootstrap usage:\n"
                     "  python copier_account_manager.py "
-                    "--bootstrap <copier_ip>"
+                    "--bootstrap <copier_ip>\n\n"
+
+                    "One Touch fleet migration:\n"
+                    "  python copier_account_manager.py "
+                    "--onetouch-all"
                 )
 
             main()
 
     except KeyboardInterrupt:
+
         print(
             "\nCancelled."
         )
 
-        if not bootstrap_mode:
+        if (
+            not bootstrap_mode
+            and not one_touch_all_mode
+        ):
             print(
                 "Queue files were preserved."
             )
@@ -2228,18 +2823,29 @@ if __name__ == "__main__":
         raise SystemExit(130)
 
     except Exception as error:
+
         print(
             f"\nERROR: {error}"
         )
 
         if bootstrap_mode:
+
             print(
                 "\nBootstrap stopped. "
                 "The normal copier queues and database "
                 "were not modified."
             )
 
+        elif one_touch_all_mode:
+
+            print(
+                "\nOne Touch migration stopped. "
+                "The normal copier queues and database "
+                "were not modified."
+            )
+
         else:
+
             print(
                 "\nQueue files were preserved. "
                 "Correct the problem and rerun "
