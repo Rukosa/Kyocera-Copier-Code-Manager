@@ -460,7 +460,10 @@ class Kyocera:
 
     # JOB ACCOUNTING LISTING
 
-    def _parse_accounts(self, text):
+    def _parse_accounts(
+        self,
+        text,
+    ):
 
         pattern = re.compile(
             r"_pp\.sDeptPrivateID\[index\]\s*=\s*"
@@ -468,23 +471,39 @@ class Kyocera:
             r"_pp\.sDeptPublicID\[index\]\s*=\s*"
             r"'(?P<public>[^']+)';.*?"
             r"_pp\.sDeptName\[index\]\s*=\s*"
-            r"'(?P<name>[^']+)';",
+            r"'(?P<name>(?:\\.|[^'])*)';",
             re.S,
         )
 
-        return [
-            {
-                "private_id":
-                    match.group("private"),
+        accounts = []
 
-                "code":
-                    match.group("public"),
+        for match in pattern.finditer(
+            text
+        ):
+            name = match.group(
+                "name"
+            )
 
-                "name":
-                    match.group("name"),
-            }
-            for match in pattern.finditer(text)
-        ]
+            name = (
+                name
+                .replace("\\'", "'")
+                .replace("\\\\", "\\")
+            )
+
+            accounts.append(
+                {
+                    "private_id":
+                        match.group("private"),
+
+                    "code":
+                        match.group("public"),
+
+                    "name":
+                        name,
+                }
+            )
+
+        return accounts
 
     def get_account_page(
         self,
@@ -816,28 +835,43 @@ class Kyocera:
             r"_pp\.AddrNumber\[index\]\s*=\s*"
             r"'(?P<number>\d+)';.*?"
             r"_pp\.AddrType\[index\]\s*=\s*"
-            r"'(?P<name>[^']+)';.*?"
+            r"'(?P<name>(?:\\.|[^'])*)';.*?"
             r"_pp\.publicPrivate\[index\]\s*=\s*"
             r"'(?P<private>\d+)';",
             re.S,
         )
 
-        return [
-            {
-                "private_id":
-                    match.group("private"),
+        accounts = []
 
-                "number":
-                    match.group("number"),
+        for match in pattern.finditer(
+            text
+        ):
+            name = match.group(
+                "name"
+            )
 
-                "name":
-                    match.group("name").replace(
-                        "&nbsp;",
-                        " ",
-                    ),
-            }
-            for match in pattern.finditer(text)
-        ]
+            # Decode escaped JavaScript apostrophes/backslashes.
+            name = (
+                name
+                .replace("\\'", "'")
+                .replace("\\\\", "\\")
+                .replace("&nbsp;", " ")
+            )
+
+            accounts.append(
+                {
+                    "private_id":
+                        match.group("private"),
+
+                    "number":
+                        match.group("number"),
+
+                    "name":
+                        name,
+                }
+            )
+
+        return accounts
 
     def get_address_book_page(
         self,
@@ -1315,7 +1349,7 @@ class Kyocera:
 
         person = self.find_address(
             number=number,
-            refresh=True,
+            refresh=False,
         )
 
         if person is None:
@@ -1335,7 +1369,7 @@ class Kyocera:
 
         person = self.find_address(
             name=name,
-            refresh=True,
+            refresh=False,
         )
 
         if person is None:
@@ -1898,9 +1932,31 @@ def process_deletions_on_copier(
     try:
         copier.login()
 
-        # Load Job Accounting once. This also obtains the
-        # required Job Accounting hidden token.
-        copier.get_all_accounts()
+        # Load Job Accounting once.
+        accounts = copier.get_all_accounts()
+
+        # Load Address Book once.
+        address_book = copier.get_all_address_book(
+            refresh=True
+        )
+
+        # Build fast lookup tables from the snapshots.
+        accounts_by_code = {
+            str(account["code"]):
+                account
+            for account in accounts
+        }
+
+        addresses_by_number = {
+            (
+                str(
+                    address["number"]
+                ).lstrip("0")
+                or "0"
+            ):
+                address
+            for address in address_book
+        }
 
         for record in deletion_records:
             copier_code = record[
@@ -1911,6 +1967,11 @@ def process_deletions_on_copier(
                 "display_name"
             ]
 
+            normalized_code = (
+                str(copier_code).lstrip("0")
+                or "0"
+            )
+
             print(
                 f"\nDeleting {display_name} "
                 f"[{copier_code}] from {host}..."
@@ -1918,8 +1979,8 @@ def process_deletions_on_copier(
 
             # JOB ACCOUNTING DELETION
 
-            account = copier.find_account(
-                code=copier_code
+            account = accounts_by_code.get(
+                str(copier_code)
             )
 
             if account is None:
@@ -1941,9 +2002,8 @@ def process_deletions_on_copier(
 
             # ADDRESS BOOK DELETION
 
-            address = copier.find_address(
-                number=copier_code,
-                refresh=True,
+            address = addresses_by_number.get(
+                normalized_code
             )
 
             if address is None:
